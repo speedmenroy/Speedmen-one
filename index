@@ -1,0 +1,941 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Speedmen-One</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @keyframes drift {
+      0%   { transform: translate(5vw, 10vh); }
+      20%  { transform: translate(55vw, 15vh); }
+      40%  { transform: translate(60vw, 55vh); }
+      60%  { transform: translate(15vw, 60vh); }
+      80%  { transform: translate(40vw, 30vh); }
+      100% { transform: translate(5vw, 10vh); }
+    }
+    @keyframes hueShift {
+      0%   { background-position: 0% 50%; }
+      50%  { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .ss-bg {
+      background: linear-gradient(120deg, #451a03, #7c2d12, #713f12, #422006);
+      background-size: 300% 300%;
+      animation: hueShift 12s ease infinite;
+    }
+    .ss-card { animation: drift 22s ease-in-out infinite; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.3.1",
+      "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+      "react-dom": "https://esm.sh/react-dom@18.3.1",
+      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+      "lucide-react": "https://esm.sh/lucide-react@0.436.0?external=react",
+      "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module" data-presets="react">
+    import React, { useState, useMemo, useEffect, useRef } from 'react';
+    import { createRoot } from 'react-dom/client';
+    import {
+      Home, Lightbulb, Briefcase, Activity, Wallet, Plus, Trash2, Check,
+      ChevronLeft, ChevronRight, X, ExternalLink, Circle, CheckCircle2,
+      Bell, BellRing, Clock, BookOpen, Image as ImageIcon, AlarmClock, Database,
+      Download, Upload
+    } from 'lucide-react';
+    import {
+      PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip,
+      ResponsiveContainer, Legend, CartesianGrid
+    } from 'recharts';
+
+    // ---------- localStorage-backed state hook ----------
+    const STORE_PREFIX = 'speedmenOne:';
+    const STORE_KEYS = ['todos','reminders','events','maps','workLinks','runLinks','books','entries'];
+
+    function usePersistentState(key, initial) {
+      const storageKey = STORE_PREFIX + key;
+      const [value, setValue] = useState(() => {
+        try {
+          const raw = localStorage.getItem(storageKey);
+          if (raw !== null) return JSON.parse(raw);
+        } catch (e) { /* ignore */ }
+        return initial;
+      });
+      useEffect(() => {
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(value));
+        } catch (e) { /* quota or sandbox errors ignored */ }
+      }, [storageKey, value]);
+      return [value, setValue];
+    }
+
+    // Compress + resize an image file to a small JPEG data URL
+    function compressImage(file, maxSize = 400, quality = 0.7) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const img = new Image();
+          img.onload = () => {
+            let { width, height } = img;
+            if (width > height && width > maxSize) { height = (height * maxSize) / width; width = maxSize; }
+            else if (height > maxSize) { width = (width * maxSize) / height; height = maxSize; }
+            const canvas = document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+          };
+          img.onerror = reject;
+          img.src = reader.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // ---- HK Public Holidays 2026 (approximate; verify official gazette) ----
+    const HK_HOLIDAYS = {
+      '2026-01-01': "New Year's Day",
+      '2026-02-17': 'Lunar New Year',
+      '2026-02-18': 'Lunar New Year (2nd day)',
+      '2026-02-19': 'Lunar New Year (3rd day)',
+      '2026-04-03': 'Good Friday',
+      '2026-04-04': 'Day after Good Friday',
+      '2026-04-06': 'Easter Monday',
+      '2026-04-07': 'Ching Ming Festival',
+      '2026-05-01': 'Labour Day',
+      '2026-05-25': "Buddha's Birthday",
+      '2026-06-19': 'Tuen Ng Festival',
+      '2026-07-01': 'HKSAR Establishment Day',
+      '2026-09-26': 'Day after Mid-Autumn Festival',
+      '2026-10-01': 'National Day',
+      '2026-10-19': 'Chung Yeung Festival',
+      '2026-12-25': 'Christmas Day',
+      '2026-12-26': 'Boxing Day',
+    };
+
+    const EVENT_TYPES = {
+      'Annual Leave': 'bg-emerald-700',
+      'Meeting': 'bg-orange-700',
+      'Lesson': 'bg-amber-800',
+      'Visit': 'bg-yellow-600',
+      'Others': 'bg-stone-500',
+    };
+
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const CAT_COLORS = {
+      Earning:   '#4d7c0f',
+      Investing: '#92400e',
+      Saving:    '#ca8a04',
+      Groceries: '#a16207',
+      Insurance: '#57534e',
+      Beauty:    '#b45309',
+      Others:    '#78716c',
+    };
+
+    let uid = 0;
+    const nid = () => `id-${Date.now()}-${uid++}`;
+    const pad = (n) => String(n).padStart(2, '0');
+    const dateKey = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
+    const fmtTime = (iso) => {
+      if (!iso) return '';
+      const d = new Date(iso);
+      return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    };
+
+    function PersonalHub() {
+      const [tab, setTab] = useState('dashboard');
+
+      // ---------- To-do ----------
+      const [todos, setTodos] = usePersistentState('todos', [
+        { id: nid(), text: 'Prepare weekly report', done: false },
+        { id: nid(), text: 'Reply to student emails', done: true },
+      ]);
+      const [todoInput, setTodoInput] = useState('');
+
+      const addTodo = () => {
+        if (!todoInput.trim()) return;
+        setTodos([{ id: nid(), text: todoInput.trim(), done: false }, ...todos]);
+        setTodoInput('');
+      };
+
+      // ---------- Reminders ----------
+      const [reminders, setReminders] = usePersistentState('reminders', []);
+      const [remText, setRemText] = useState('');
+      const [remTime, setRemTime] = useState('');
+      const [activeReminder, setActiveReminder] = useState(null);
+
+      const addReminder = () => {
+        if (!remText.trim() || !remTime) return;
+        setReminders([...reminders, { id: nid(), text: remText.trim(), time: remTime, fired: false }]
+          .sort((a, b) => new Date(a.time) - new Date(b.time)));
+        setRemText(''); setRemTime('');
+      };
+
+      const deleteReminder = (id) => setReminders(reminders.filter((r) => r.id !== id));
+
+      useEffect(() => {
+        const iv = setInterval(() => {
+          const now = Date.now();
+          setReminders((prev) => {
+            let toFire = null;
+            const next = prev.map((r) => {
+              if (!r.fired && r.time && new Date(r.time).getTime() <= now) {
+                if (!toFire) toFire = r;
+                return { ...r, fired: true };
+              }
+              return r;
+            });
+            if (toFire) setActiveReminder(toFire);
+            return next;
+          });
+        }, 5000);
+        return () => clearInterval(iv);
+      }, []);
+
+      const snoozeReminder = () => {
+        if (!activeReminder) return;
+        const newTime = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+        setReminders((prev) => prev.map((r) => r.id === activeReminder.id ? { ...r, time: newTime, fired: false } : r));
+        setActiveReminder(null);
+      };
+
+      const previewReminder = () => {
+        setActiveReminder({ id: 'preview', text: remText.trim() || 'This is how your reminder will pop up!', time: new Date().toISOString() });
+      };
+
+      // ---------- Calendar ----------
+      const today = new Date();
+      const [calY, setCalY] = useState(2026);
+      const [calM, setCalM] = useState(6);
+      const [events, setEvents] = usePersistentState('events', {
+        '2026-07-10': [{ id: nid(), type: 'Meeting', text: 'Team sync 3pm' }],
+        '2026-07-15': [{ id: nid(), type: 'Lesson', text: 'Piano lesson' }],
+      });
+      const [modalDate, setModalDate] = useState(null);
+      const [evType, setEvType] = useState('Meeting');
+      const [evText, setEvText] = useState('');
+
+      const changeMonth = (delta) => {
+        let m = calM + delta, y = calY;
+        if (m < 0) { m = 11; y--; }
+        if (m > 11) { m = 0; y++; }
+        setCalM(m); setCalY(y);
+      };
+
+      const addEvent = () => {
+        if (!evText.trim() || !modalDate) return;
+        setEvents((prev) => ({
+          ...prev,
+          [modalDate]: [...(prev[modalDate] || []), { id: nid(), type: evType, text: evText.trim() }],
+        }));
+        setEvText('');
+      };
+
+      const deleteEvent = (key, id) => {
+        setEvents((prev) => ({ ...prev, [key]: prev[key].filter((e) => e.id !== id) }));
+      };
+
+      const calendarCells = useMemo(() => {
+        const first = new Date(calY, calM, 1).getDay();
+        const days = new Date(calY, calM + 1, 0).getDate();
+        const cells = [];
+        for (let i = 0; i < first; i++) cells.push(null);
+        for (let d = 1; d <= days; d++) cells.push(d);
+        return cells;
+      }, [calY, calM]);
+
+      // ---------- Mind Map ----------
+      const [maps, setMaps] = usePersistentState('maps', [
+        { id: nid(), root: { id: nid(), text: 'New Business Idea', children: [
+          { id: nid(), text: 'Target Market', children: [] },
+          { id: nid(), text: 'Budget', children: [] },
+        ] } },
+      ]);
+      const [activeMap, setActiveMap] = useState(0);
+      const [selectedNode, setSelectedNode] = useState(null);
+      const [nodeInput, setNodeInput] = useState('');
+      const [newMapInput, setNewMapInput] = useState('');
+
+      const addMap = () => {
+        if (!newMapInput.trim()) return;
+        const m = { id: nid(), root: { id: nid(), text: newMapInput.trim(), children: [] } };
+        setMaps([...maps, m]);
+        setActiveMap(maps.length);
+        setNewMapInput('');
+      };
+
+      const findNode = (node, id) => {
+        if (node.id === id) return node;
+        for (const c of node.children) {
+          const f = findNode(c, id);
+          if (f) return f;
+        }
+        return null;
+      };
+
+      const addChild = () => {
+        if (!nodeInput.trim() || !selectedNode) return;
+        const newMaps = maps.map((m) => ({ ...m }));
+        const root = JSON.parse(JSON.stringify(newMaps[activeMap].root));
+        const target = findNode(root, selectedNode);
+        if (target) target.children.push({ id: nid(), text: nodeInput.trim(), children: [] });
+        newMaps[activeMap].root = root;
+        setMaps(newMaps);
+        setNodeInput('');
+      };
+
+      const deleteNode = () => {
+        if (!selectedNode) return;
+        const root = JSON.parse(JSON.stringify(maps[activeMap].root));
+        if (root.id === selectedNode) return;
+        const remove = (node) => {
+          node.children = node.children.filter((c) => c.id !== selectedNode);
+          node.children.forEach(remove);
+        };
+        remove(root);
+        const newMaps = maps.map((m) => ({ ...m }));
+        newMaps[activeMap].root = root;
+        setMaps(newMaps);
+        setSelectedNode(null);
+      };
+
+      const safeActiveMap = Math.min(activeMap, Math.max(0, maps.length - 1));
+      const layout = useMemo(() => {
+        if (!maps[safeActiveMap]) return [];
+        const root = maps[safeActiveMap].root;
+        const pos = [];
+        const cx = 400, cy = 300;
+        pos.push({ id: root.id, text: root.text, x: cx, y: cy, level: 0, parent: null });
+        const kids = root.children;
+        const n = kids.length;
+        kids.forEach((c, i) => {
+          const ang = (i / Math.max(n, 1)) * 2 * Math.PI - Math.PI / 2;
+          const x = cx + 165 * Math.cos(ang);
+          const y = cy + 150 * Math.sin(ang);
+          pos.push({ id: c.id, text: c.text, x, y, level: 1, parent: root.id });
+          const gk = c.children;
+          const m = gk.length;
+          gk.forEach((g, j) => {
+            const a = ang + (j - (m - 1) / 2) * 0.4;
+            const gx = x + 120 * Math.cos(a);
+            const gy = y + 120 * Math.sin(a);
+            pos.push({ id: g.id, text: g.text, x: gx, y: gy, level: 2, parent: c.id });
+          });
+        });
+        return pos;
+      }, [maps, safeActiveMap]);
+
+      const posById = (id) => layout.find((p) => p.id === id);
+
+      // ---------- Links ----------
+      const [workLinks, setWorkLinks] = usePersistentState('workLinks', [
+        { id: nid(), name: 'Gmail', url: 'https://mail.google.com' },
+        { id: nid(), name: 'Google Drive', url: 'https://drive.google.com' },
+      ]);
+      const [runLinks, setRunLinks] = usePersistentState('runLinks', [
+        { id: nid(), name: 'Strava', url: 'https://strava.com' },
+      ]);
+      const [linkName, setLinkName] = useState('');
+      const [linkUrl, setLinkUrl] = useState('');
+
+      const addLink = (which) => {
+        if (!linkName.trim() || !linkUrl.trim()) return;
+        let url = linkUrl.trim();
+        if (!/^https?:\/\//.test(url)) url = 'https://' + url;
+        const item = { id: nid(), name: linkName.trim(), url };
+        if (which === 'work') setWorkLinks([...workLinks, item]);
+        else setRunLinks([...runLinks, item]);
+        setLinkName(''); setLinkUrl('');
+      };
+
+      // ---------- Books ----------
+      const [books, setBooks] = usePersistentState('books', [
+        { id: nid(), title: 'Atomic Habits', author: 'James Clear', status: 'Reading', image: null },
+        { id: nid(), title: 'Deep Work', author: 'Cal Newport', status: 'To Read', image: null },
+      ]);
+      const [bkTitle, setBkTitle] = useState('');
+      const [bkAuthor, setBkAuthor] = useState('');
+      const [bkStatus, setBkStatus] = useState('To Read');
+
+      const addBook = () => {
+        if (!bkTitle.trim()) return;
+        setBooks([...books, { id: nid(), title: bkTitle.trim(), author: bkAuthor.trim(), status: bkStatus, image: null }]);
+        setBkTitle(''); setBkAuthor(''); setBkStatus('To Read');
+      };
+
+      const setBookImage = async (id, file) => {
+        if (!file) return;
+        try {
+          const dataUrl = await compressImage(file, 400, 0.7);
+          setBooks((prev) => prev.map((b) => b.id === id ? { ...b, image: dataUrl } : b));
+        } catch (e) { /* ignore */ }
+      };
+
+      const cycleStatus = (id) => {
+        const order = ['To Read', 'Reading', 'Finished'];
+        setBooks((prev) => prev.map((b) => b.id === id ? { ...b, status: order[(order.indexOf(b.status) + 1) % order.length] } : b));
+      };
+
+      const STATUS_STYLE = {
+        'To Read': 'bg-stone-200 text-stone-700',
+        'Reading': 'bg-orange-200 text-orange-800',
+        'Finished': 'bg-lime-200 text-lime-800',
+      };
+
+      // ---------- Expenses ----------
+      const [entries, setEntries] = usePersistentState('entries', [
+        { id: nid(), type: 'Earning', label: 'Salary', amount: 40000, month: 6 },
+        { id: nid(), type: 'Investing', label: 'ETF', amount: 8000, month: 6 },
+        { id: nid(), type: 'Saving', label: 'Deposit', amount: 5000, month: 6 },
+        { id: nid(), type: 'Groceries', label: 'Supermarket', amount: 4000, month: 6 },
+        { id: nid(), type: 'Others', label: 'Rent + bills', amount: 15000, month: 6 },
+        { id: nid(), type: 'Earning', label: 'Salary', amount: 40000, month: 7 },
+        { id: nid(), type: 'Insurance', label: 'Life plan', amount: 2000, month: 7 },
+        { id: nid(), type: 'Beauty', label: 'Salon', amount: 1200, month: 7 },
+        { id: nid(), type: 'Others', label: 'Living', amount: 18000, month: 7 },
+      ]);
+      const [exType, setExType] = useState('Earning');
+      const [exLabel, setExLabel] = useState('');
+      const [exAmount, setExAmount] = useState('');
+      const [exMonth, setExMonth] = useState(6);
+
+      const addEntry = () => {
+        const amt = parseFloat(exAmount);
+        if (!exLabel.trim() || isNaN(amt)) return;
+        setEntries([...entries, { id: nid(), type: exType, label: exLabel.trim(), amount: amt, month: exMonth }]);
+        setExLabel(''); setExAmount('');
+      };
+
+      const pieData = useMemo(() => {
+        const totals = {};
+        entries.forEach((e) => { totals[e.type] = (totals[e.type] || 0) + e.amount; });
+        return Object.keys(totals).map((k) => ({ name: k, value: totals[k] }));
+      }, [entries]);
+
+      const netData = useMemo(() => {
+        const byMonth = {};
+        entries.forEach((e) => {
+          if (!byMonth[e.month]) byMonth[e.month] = { earn: 0, out: 0 };
+          if (e.type === 'Earning') byMonth[e.month].earn += e.amount;
+          else byMonth[e.month].out += e.amount;
+        });
+        return Object.keys(byMonth).sort((a, b) => a - b).map((m) => ({
+          month: MONTHS[m],
+          Net: byMonth[m].earn - byMonth[m].out,
+        }));
+      }, [entries]);
+
+      // ---------- Export / Import ----------
+      const fileInputRef = useRef(null);
+      const [toast, setToast] = useState(null);
+      const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+
+      const exportData = () => {
+        const data = {
+          app: 'Speedmen-One',
+          version: 1,
+          exportedAt: new Date().toISOString(),
+          data: { todos, reminders, events, maps, workLinks, runLinks, books, entries },
+        };
+        try {
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `speedmen-one-backup-${new Date().toISOString().slice(0, 10)}.json`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          showToast('Backup downloaded ✓');
+        } catch (e) {
+          showToast('Export failed');
+        }
+      };
+
+      const importData = (file) => {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const parsed = JSON.parse(reader.result);
+            const d = parsed.data || parsed;
+            // Persist directly, then reload so every hook re-reads from storage
+            STORE_KEYS.forEach((k) => {
+              if (d[k] !== undefined) {
+                localStorage.setItem(STORE_PREFIX + k, JSON.stringify(d[k]));
+              }
+            });
+            showToast('Imported ✓ Reloading...');
+            setTimeout(() => window.location.reload(), 800);
+          } catch (e) {
+            showToast('Invalid backup file');
+          }
+        };
+        reader.onerror = () => showToast('Could not read file');
+        reader.readAsText(file);
+      };
+
+      // ---------- Clear all ----------
+      const [confirmClear, setConfirmClear] = useState(false);
+      const clearAll = () => {
+        try {
+          Object.keys(localStorage).forEach((k) => { if (k.startsWith(STORE_PREFIX)) localStorage.removeItem(k); });
+        } catch (e) { /* ignore */ }
+        window.location.reload();
+      };
+
+      const tabs = [
+        { id: 'dashboard', label: 'Dashboard', icon: Home },
+        { id: 'ideas', label: 'Ideas', icon: Lightbulb },
+        { id: 'work', label: 'Work Links', icon: Briefcase },
+        { id: 'running', label: 'Running', icon: Activity },
+        { id: 'books', label: 'Books', icon: BookOpen },
+        { id: 'expenses', label: 'Expenses', icon: Wallet },
+      ];
+
+      return (
+        <div className="min-h-screen bg-stone-100 text-stone-800">
+          <header className="bg-gradient-to-r from-amber-800 to-orange-800 text-white px-4 py-4 shadow-md flex items-center justify-between gap-2 flex-wrap">
+            <div>
+              <h1 className="text-xl font-bold tracking-wide">Speedmen-One</h1>
+              <p className="text-xs text-amber-100 flex items-center gap-1"><Database className="w-3 h-3" /> Auto-saved to this browser</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={exportData} className="text-xs bg-white/15 hover:bg-white/25 px-3 py-1.5 rounded-lg flex items-center gap-1"><Download className="w-3.5 h-3.5" /> Export</button>
+              <button onClick={() => fileInputRef.current && fileInputRef.current.click()} className="text-xs bg-white/15 hover:bg-white/25 px-3 py-1.5 rounded-lg flex items-center gap-1"><Upload className="w-3.5 h-3.5" /> Import</button>
+              <input ref={fileInputRef} type="file" accept="application/json,.json" className="hidden"
+                onChange={(e) => { importData(e.target.files[0]); e.target.value = ''; }} />
+              <button onClick={() => setConfirmClear(true)} className="text-xs bg-white/15 hover:bg-white/25 px-3 py-1.5 rounded-lg flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> Clear</button>
+            </div>
+          </header>
+
+          <nav className="flex flex-wrap gap-1 bg-stone-50 px-2 py-2 shadow-sm sticky top-0 z-20">
+            {tabs.map((t) => {
+              const Icon = t.icon;
+              const active = tab === t.id;
+              return (
+                <button key={t.id} onClick={() => setTab(t.id)}
+                  className={`flex items-center gap-1 px-3 py-2 rounded-lg text-sm font-medium transition ${active ? 'bg-amber-800 text-white' : 'text-stone-600 hover:bg-stone-200'}`}>
+                  <Icon className="w-4 h-4" /> <span className="hidden sm:inline">{t.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+
+          <main className="p-4 max-w-5xl mx-auto">
+            {/* ---------------- DASHBOARD ---------------- */}
+            {tab === 'dashboard' && (
+              <div className="space-y-6">
+                <section className="bg-white rounded-xl shadow p-4">
+                  <h2 className="font-bold text-lg mb-3 flex items-center gap-2"><Check className="w-5 h-5 text-amber-800" /> To-Do List</h2>
+                  <div className="flex gap-2 mb-3">
+                    <input value={todoInput} onChange={(e) => setTodoInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && addTodo()}
+                      placeholder="What do you have to do?"
+                      className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500" />
+                    <button onClick={addTodo} className="bg-amber-800 text-white px-3 rounded-lg hover:bg-amber-900"><Plus className="w-5 h-5" /></button>
+                  </div>
+                  <ul className="space-y-2">
+                    {todos.length === 0 && <li className="text-stone-400 text-sm">Nothing to do. Add a task!</li>}
+                    {todos.map((t) => (
+                      <li key={t.id} className="flex items-center gap-2 bg-stone-50 rounded-lg px-3 py-2">
+                        <button onClick={() => setTodos(todos.map((x) => x.id === t.id ? { ...x, done: !x.done } : x))}>
+                          {t.done ? <CheckCircle2 className="w-5 h-5 text-lime-700" /> : <Circle className="w-5 h-5 text-stone-400" />}
+                        </button>
+                        <span className={`flex-1 text-sm ${t.done ? 'line-through text-stone-400' : ''}`}>{t.text}</span>
+                        <button onClick={() => setTodos(todos.filter((x) => x.id !== t.id))} className="text-stone-400 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+
+                <section className="bg-white rounded-xl shadow p-4">
+                  <h2 className="font-bold text-lg mb-3 flex items-center gap-2"><Bell className="w-5 h-5 text-orange-700" /> Reminders</h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto_auto] gap-2 mb-3">
+                    <input value={remText} onChange={(e) => setRemText(e.target.value)}
+                      placeholder="Remind me to..."
+                      className="border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
+                    <input type="datetime-local" value={remTime} onChange={(e) => setRemTime(e.target.value)}
+                      className="border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
+                    <button onClick={addReminder} className="bg-orange-700 text-white px-4 py-2 rounded-lg text-sm hover:bg-orange-800 flex items-center justify-center gap-1"><Plus className="w-4 h-4" /> Add</button>
+                    <button onClick={previewReminder} title="Preview the screensaver popup" className="bg-stone-200 text-stone-700 px-3 py-2 rounded-lg text-sm hover:bg-stone-300 flex items-center justify-center gap-1"><AlarmClock className="w-4 h-4" /> Preview</button>
+                  </div>
+                  <ul className="space-y-2">
+                    {reminders.length === 0 && <li className="text-stone-400 text-sm">No reminders. They’ll pop up full-screen when due.</li>}
+                    {reminders.map((r) => (
+                      <li key={r.id} className="flex items-center gap-2 bg-stone-50 rounded-lg px-3 py-2">
+                        {r.fired ? <BellRing className="w-4 h-4 text-stone-400" /> : <Clock className="w-4 h-4 text-orange-600" />}
+                        <span className={`flex-1 text-sm ${r.fired ? 'text-stone-400 line-through' : ''}`}>{r.text}</span>
+                        <span className="text-xs text-stone-500">{fmtTime(r.time)}</span>
+                        <button onClick={() => deleteReminder(r.id)} className="text-stone-400 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+
+                <section className="bg-white rounded-xl shadow p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <button onClick={() => changeMonth(-1)} className="p-1 rounded hover:bg-stone-100"><ChevronLeft className="w-5 h-5" /></button>
+                    <h2 className="font-bold text-lg">{MONTHS[calM]} {calY}</h2>
+                    <button onClick={() => changeMonth(1)} className="p-1 rounded hover:bg-stone-100"><ChevronRight className="w-5 h-5" /></button>
+                  </div>
+                  <div className="grid grid-cols-7 gap-1 text-center text-xs font-semibold text-stone-500 mb-1">
+                    {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map((d) => <div key={d}>{d}</div>)}
+                  </div>
+                  <div className="grid grid-cols-7 gap-1">
+                    {calendarCells.map((d, i) => {
+                      if (!d) return <div key={i} />;
+                      const key = dateKey(calY, calM, d);
+                      const holiday = HK_HOLIDAYS[key];
+                      const dayEvents = events[key] || [];
+                      const isToday = today.getFullYear() === calY && today.getMonth() === calM && today.getDate() === d;
+                      return (
+                        <button key={i} onClick={() => setModalDate(key)}
+                          className={`min-h-16 rounded-lg border p-1 text-left flex flex-col hover:border-amber-500 transition ${holiday ? 'bg-red-50 border-red-200' : 'bg-white border-stone-200'} ${isToday ? 'ring-2 ring-amber-700' : ''}`}>
+                          <span className={`text-xs font-semibold ${holiday ? 'text-red-700' : 'text-stone-700'}`}>{d}</span>
+                          {holiday && <span className="text-[9px] leading-tight text-red-600 truncate">{holiday}</span>}
+                          <div className="flex flex-col gap-0.5 mt-0.5">
+                            {dayEvents.slice(0, 2).map((e) => (
+                              <span key={e.id} className={`text-[9px] text-white rounded px-1 truncate ${EVENT_TYPES[e.type]}`}>{e.text}</span>
+                            ))}
+                            {dayEvents.length > 2 && <span className="text-[9px] text-stone-500">+{dayEvents.length - 2} more</span>}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    {Object.keys(EVENT_TYPES).map((t) => (
+                      <span key={t} className="flex items-center gap-1 text-xs text-stone-600">
+                        <span className={`w-3 h-3 rounded ${EVENT_TYPES[t]}`} /> {t}
+                      </span>
+                    ))}
+                    <span className="flex items-center gap-1 text-xs text-stone-600"><span className="w-3 h-3 rounded bg-red-300" /> HK Holiday</span>
+                  </div>
+                </section>
+              </div>
+            )}
+
+            {/* ---------------- IDEAS / MIND MAP ---------------- */}
+            {tab === 'ideas' && (
+              <div className="space-y-4">
+                <section className="bg-white rounded-xl shadow p-4">
+                  <h2 className="font-bold text-lg mb-3 flex items-center gap-2"><Lightbulb className="w-5 h-5 text-yellow-600" /> Capture an Idea</h2>
+                  <div className="flex gap-2 mb-3">
+                    <input value={newMapInput} onChange={(e) => setNewMapInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && addMap()}
+                      placeholder="New idea / mind map title..."
+                      className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-500" />
+                    <button onClick={addMap} className="bg-yellow-600 text-white px-3 rounded-lg hover:bg-yellow-700"><Plus className="w-5 h-5" /></button>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {maps.map((m, i) => (
+                      <button key={m.id} onClick={() => { setActiveMap(i); setSelectedNode(null); }}
+                        className={`px-3 py-1 rounded-full text-sm ${safeActiveMap === i ? 'bg-yellow-600 text-white' : 'bg-stone-100 text-stone-600'}`}>
+                        {m.root.text}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="bg-white rounded-xl shadow p-4">
+                  <p className="text-xs text-stone-500 mb-2">Tap a node to select it, then add a sub-idea below.</p>
+                  <div className="w-full overflow-hidden rounded-lg bg-stone-50 border border-stone-200">
+                    <svg viewBox="0 0 800 600" className="w-full h-auto">
+                      {layout.map((p) => p.parent && (
+                        <line key={'l' + p.id} x1={posById(p.parent).x} y1={posById(p.parent).y} x2={p.x} y2={p.y} stroke="#d6d3d1" strokeWidth="2" />
+                      ))}
+                      {layout.map((p) => {
+                        const w = Math.max(70, Math.min(150, p.text.length * 8 + 20));
+                        const fill = p.level === 0 ? '#92400e' : p.level === 1 ? '#c2410c' : '#ca8a04';
+                        const sel = selectedNode === p.id;
+                        return (
+                          <g key={p.id} onClick={() => setSelectedNode(p.id)} style={{ cursor: 'pointer' }}>
+                            <rect x={p.x - w / 2} y={p.y - 16} width={w} height={32} rx={16}
+                              fill={fill} stroke={sel ? '#1c1917' : 'white'} strokeWidth={sel ? 3 : 2} />
+                            <text x={p.x} y={p.y + 5} textAnchor="middle" fill="white" fontSize="12" fontWeight="600">
+                              {p.text.length > 16 ? p.text.slice(0, 15) + '…' : p.text}
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </svg>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2 mt-3">
+                    <input value={nodeInput} onChange={(e) => setNodeInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && addChild()}
+                      placeholder={selectedNode ? 'Add sub-idea to selected node...' : 'Select a node first'}
+                      disabled={!selectedNode}
+                      className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm disabled:bg-stone-100 focus:outline-none focus:ring-2 focus:ring-orange-500" />
+                    <button onClick={addChild} disabled={!selectedNode} className="bg-orange-700 text-white px-4 py-2 rounded-lg text-sm hover:bg-orange-800 disabled:opacity-40">Add Sub-idea</button>
+                    <button onClick={deleteNode} disabled={!selectedNode} className="bg-red-700 text-white px-4 py-2 rounded-lg text-sm hover:bg-red-800 disabled:opacity-40">Delete Node</button>
+                  </div>
+                </section>
+              </div>
+            )}
+
+            {/* ---------------- WORK LINKS ---------------- */}
+            {tab === 'work' && (
+              <LinksPanel title="Work Apps" icon={Briefcase} color="amber" links={workLinks}
+                setLinks={setWorkLinks} which="work" linkName={linkName} setLinkName={setLinkName}
+                linkUrl={linkUrl} setLinkUrl={setLinkUrl} addLink={addLink} />
+            )}
+
+            {/* ---------------- RUNNING LINKS ---------------- */}
+            {tab === 'running' && (
+              <LinksPanel title="Running Apps" icon={Activity} color="terracotta" links={runLinks}
+                setLinks={setRunLinks} which="running" linkName={linkName} setLinkName={setLinkName}
+                linkUrl={linkUrl} setLinkUrl={setLinkUrl} addLink={addLink} />
+            )}
+
+            {/* ---------------- BOOKS ---------------- */}
+            {tab === 'books' && (
+              <div className="space-y-4">
+                <section className="bg-white rounded-xl shadow p-4">
+                  <h2 className="font-bold text-lg mb-3 flex items-center gap-2"><BookOpen className="w-5 h-5 text-amber-800" /> Add a Book</h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto_auto] gap-2">
+                    <input value={bkTitle} onChange={(e) => setBkTitle(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && addBook()}
+                      placeholder="Title" className="border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500" />
+                    <input value={bkAuthor} onChange={(e) => setBkAuthor(e.target.value)}
+                      placeholder="Author" className="border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500" />
+                    <select value={bkStatus} onChange={(e) => setBkStatus(e.target.value)} className="border border-stone-300 rounded-lg px-2 py-2 text-sm">
+                      <option>To Read</option><option>Reading</option><option>Finished</option>
+                    </select>
+                    <button onClick={addBook} className="bg-amber-800 text-white px-4 py-2 rounded-lg text-sm hover:bg-amber-900 flex items-center justify-center gap-1"><Plus className="w-4 h-4" /> Add</button>
+                  </div>
+                </section>
+
+                <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                  {books.map((b) => (
+                    <div key={b.id} className="relative bg-white rounded-xl shadow overflow-hidden group flex flex-col">
+                      <div className="aspect-[3/4] bg-stone-100 flex items-center justify-center overflow-hidden">
+                        {b.image
+                          ? <img src={b.image} alt={b.title} className="w-full h-full object-cover" />
+                          : <div className="flex flex-col items-center text-stone-400"><ImageIcon className="w-8 h-8" /><span className="text-[10px] mt-1">No cover</span></div>}
+                      </div>
+                      <div className="p-3 flex flex-col gap-1 flex-1">
+                        <span className="text-sm font-semibold leading-tight">{b.title}</span>
+                        {b.author && <span className="text-xs text-stone-500">{b.author}</span>}
+                        <button onClick={() => cycleStatus(b.id)}
+                          className={`mt-1 self-start text-[10px] font-medium px-2 py-0.5 rounded-full ${STATUS_STYLE[b.status]}`}>
+                          {b.status}
+                        </button>
+                        <label className="mt-2 cursor-pointer text-xs text-amber-800 hover:underline flex items-center gap-1">
+                          <ImageIcon className="w-3 h-3" /> {b.image ? 'Change cover' : 'Upload cover'}
+                          <input type="file" accept="image/*" className="hidden"
+                            onChange={(e) => setBookImage(b.id, e.target.files[0])} />
+                        </label>
+                      </div>
+                      <button onClick={() => setBooks(books.filter((x) => x.id !== b.id))}
+                        className="absolute top-2 right-2 bg-white/80 rounded-full p-1 text-stone-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                  {books.length === 0 && <p className="text-stone-400 text-sm col-span-full">No books yet. Add one above!</p>}
+                </section>
+              </div>
+            )}
+
+            {/* ---------------- EXPENSES ---------------- */}
+            {tab === 'expenses' && (
+              <div className="space-y-4">
+                <section className="bg-white rounded-xl shadow p-4">
+                  <h2 className="font-bold text-lg mb-3 flex items-center gap-2"><Wallet className="w-5 h-5 text-lime-700" /> Add Entry</h2>
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                    <select value={exType} onChange={(e) => setExType(e.target.value)} className="border border-stone-300 rounded-lg px-2 py-2 text-sm">
+                      {Object.keys(CAT_COLORS).map((c) => <option key={c}>{c}</option>)}
+                    </select>
+                    <input value={exLabel} onChange={(e) => setExLabel(e.target.value)} placeholder="Label" className="border border-stone-300 rounded-lg px-2 py-2 text-sm" />
+                    <input value={exAmount} onChange={(e) => setExAmount(e.target.value)} placeholder="Amount" type="number" className="border border-stone-300 rounded-lg px-2 py-2 text-sm" />
+                    <select value={exMonth} onChange={(e) => setExMonth(Number(e.target.value))} className="border border-stone-300 rounded-lg px-2 py-2 text-sm">
+                      {MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}
+                    </select>
+                    <button onClick={addEntry} className="bg-lime-700 text-white rounded-lg px-2 py-2 text-sm hover:bg-lime-800 flex items-center justify-center gap-1"><Plus className="w-4 h-4" /> Add</button>
+                  </div>
+                </section>
+
+                <div className="grid md:grid-cols-2 gap-4">
+                  <section className="bg-white rounded-xl shadow p-4">
+                    <h3 className="font-semibold mb-2">Distribution by Category</h3>
+                    <ResponsiveContainer width="100%" height={240}>
+                      <PieChart>
+                        <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label>
+                          {pieData.map((d) => <Cell key={d.name} fill={CAT_COLORS[d.name] || '#78716c'} />)}
+                        </Pie>
+                        <Tooltip formatter={(v) => `$${v.toLocaleString()}`} />
+                        <Legend />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </section>
+
+                  <section className="bg-white rounded-xl shadow p-4">
+                    <h3 className="font-semibold mb-2">Monthly Net Income Balance</h3>
+                    <ResponsiveContainer width="100%" height={240}>
+                      <BarChart data={netData}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="month" fontSize={12} />
+                        <YAxis fontSize={12} />
+                        <Tooltip formatter={(v) => `$${v.toLocaleString()}`} />
+                        <Bar dataKey="Net">
+                          {netData.map((d, i) => <Cell key={i} fill={d.Net >= 0 ? '#4d7c0f' : '#b91c1c'} />)}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </section>
+                </div>
+
+                <section className="bg-white rounded-xl shadow p-4">
+                  <h3 className="font-semibold mb-2">All Entries</h3>
+                  <ul className="space-y-1">
+                    {entries.map((e) => (
+                      <li key={e.id} className="flex items-center gap-2 text-sm bg-stone-50 rounded-lg px-3 py-2">
+                        <span className="w-2 h-2 rounded-full" style={{ background: CAT_COLORS[e.type] || '#78716c' }} />
+                        <span className="w-20 text-stone-500">{MONTHS[e.month]}</span>
+                        <span className="w-24 font-medium">{e.type}</span>
+                        <span className="flex-1">{e.label}</span>
+                        <span className="font-semibold">${e.amount.toLocaleString()}</span>
+                        <button onClick={() => setEntries(entries.filter((x) => x.id !== e.id))} className="text-stone-400 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              </div>
+            )}
+          </main>
+
+          {/* ---------- Event Modal ---------- */}
+          {modalDate && (
+            <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={() => setModalDate(null)}>
+              <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
+                <div className="flex justify-between items-center mb-3">
+                  <h3 className="font-bold text-lg">{modalDate}</h3>
+                  <button onClick={() => setModalDate(null)}><X className="w-5 h-5 text-stone-400" /></button>
+                </div>
+                {HK_HOLIDAYS[modalDate] && <p className="text-sm text-red-700 mb-2">🎉 {HK_HOLIDAYS[modalDate]}</p>}
+                <div className="space-y-1 mb-3 max-h-40 overflow-y-auto">
+                  {(events[modalDate] || []).map((e) => (
+                    <div key={e.id} className="flex items-center gap-2 bg-stone-50 rounded-lg px-2 py-1.5">
+                      <span className={`w-2 h-2 rounded-full ${EVENT_TYPES[e.type]}`} />
+                      <span className="text-xs text-stone-500 w-24">{e.type}</span>
+                      <span className="flex-1 text-sm">{e.text}</span>
+                      <button onClick={() => deleteEvent(modalDate, e.id)} className="text-stone-400 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
+                    </div>
+                  ))}
+                  {(events[modalDate] || []).length === 0 && <p className="text-sm text-stone-400">No events yet.</p>}
+                </div>
+                <div className="flex flex-col gap-2">
+                  <select value={evType} onChange={(e) => setEvType(e.target.value)} className="border border-stone-300 rounded-lg px-3 py-2 text-sm">
+                    {Object.keys(EVENT_TYPES).map((t) => <option key={t}>{t}</option>)}
+                  </select>
+                  <div className="flex gap-2">
+                    <input value={evText} onChange={(e) => setEvText(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && addEvent()}
+                      placeholder="Description..." className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm" />
+                    <button onClick={addEvent} className="bg-amber-800 text-white px-4 rounded-lg text-sm hover:bg-amber-900">Add</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ---------- Clear-all Confirm ---------- */}
+          {confirmClear && (
+            <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-[70]" onClick={() => setConfirmClear(false)}>
+              <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+                <h3 className="font-bold text-lg mb-2">Clear all data?</h3>
+                <p className="text-sm text-stone-500 mb-4">This deletes all saved to-dos, reminders, events, ideas, links, books and expenses from this browser. Consider exporting a backup first. This cannot be undone.</p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmClear(false)} className="flex-1 bg-stone-200 text-stone-700 rounded-lg py-2 text-sm hover:bg-stone-300">Cancel</button>
+                  <button onClick={clearAll} className="flex-1 bg-red-700 text-white rounded-lg py-2 text-sm hover:bg-red-800">Delete everything</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ---------- Toast ---------- */}
+          {toast && (
+            <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[80] bg-stone-800 text-white text-sm px-4 py-2 rounded-full shadow-lg">
+              {toast}
+            </div>
+          )}
+
+          {/* ---------- Reminder Screensaver Popup ---------- */}
+          {activeReminder && (
+            <div className="fixed inset-0 z-[60] ss-bg overflow-hidden">
+              <div className="absolute top-4 right-4 z-10">
+                <button onClick={() => setActiveReminder(null)} className="bg-white/20 hover:bg-white/30 text-white rounded-full p-2">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="ss-card absolute">
+                <div className="bg-white/95 backdrop-blur rounded-2xl shadow-2xl px-6 py-5 max-w-xs">
+                  <div className="flex items-center gap-2 text-orange-700 mb-2">
+                    <BellRing className="w-6 h-6" />
+                    <span className="font-bold uppercase text-xs tracking-wide">Reminder</span>
+                  </div>
+                  <p className="text-xl font-bold text-stone-800 leading-snug">{activeReminder.text}</p>
+                  <p className="text-xs text-stone-500 mt-1">{fmtTime(activeReminder.time)}</p>
+                  <div className="flex gap-2 mt-4">
+                    {activeReminder.id !== 'preview' && (
+                      <button onClick={snoozeReminder} className="flex-1 bg-stone-200 text-stone-700 rounded-lg py-2 text-sm hover:bg-stone-300">Snooze 5 min</button>
+                    )}
+                    <button onClick={() => setActiveReminder(null)} className="flex-1 bg-amber-800 text-white rounded-lg py-2 text-sm hover:bg-amber-900">Dismiss</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function LinksPanel({ title, icon: Icon, color, links, setLinks, which, linkName, setLinkName, linkUrl, setLinkUrl, addLink }) {
+      const colorMap = {
+        amber: { bg: 'bg-amber-800', hover: 'hover:bg-amber-900', text: 'text-amber-800', ring: 'focus:ring-amber-500' },
+        terracotta: { bg: 'bg-orange-700', hover: 'hover:bg-orange-800', text: 'text-orange-700', ring: 'focus:ring-orange-500' },
+      };
+      const c = colorMap[color];
+      return (
+        <div className="space-y-4">
+          <section className="bg-white rounded-xl shadow p-4">
+            <h2 className={`font-bold text-lg mb-3 flex items-center gap-2 ${c.text}`}><Icon className="w-5 h-5" /> {title}</h2>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input value={linkName} onChange={(e) => setLinkName(e.target.value)} placeholder="Name (e.g. Gmail)" className={`flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 ${c.ring}`} />
+              <input value={linkUrl} onChange={(e) => setLinkUrl(e.target.value)} placeholder="URL" className={`flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 ${c.ring}`} />
+              <button onClick={() => addLink(which)} className={`${c.bg} ${c.hover} text-white px-4 py-2 rounded-lg text-sm flex items-center justify-center gap-1`}><Plus className="w-4 h-4" /> Add</button>
+            </div>
+          </section>
+          <section className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {links.map((l) => (
+              <div key={l.id} className="relative bg-white rounded-xl shadow p-4 hover:shadow-md transition group">
+                <a href={l.url} target="_blank" rel="noopener noreferrer" className="flex flex-col items-center gap-2">
+                  <div className={`w-12 h-12 rounded-full ${c.bg} flex items-center justify-center text-white font-bold text-lg`}>
+                    {l.name.charAt(0).toUpperCase()}
+                  </div>
+                  <span className="text-sm font-medium text-center flex items-center gap-1">{l.name} <ExternalLink className="w-3 h-3 text-stone-400" /></span>
+                </a>
+                <button onClick={() => setLinks(links.filter((x) => x.id !== l.id))} className="absolute top-2 right-2 text-stone-300 hover:text-red-600 opacity-0 group-hover:opacity-100 transition"><Trash2 className="w-4 h-4" /></button>
+              </div>
+            ))}
+            {links.length === 0 && <p className="text-stone-400 text-sm col-span-full">No links yet. Add one above!</p>}
+          </section>
+        </div>
+      );
+    }
+
+    createRoot(document.getElementById('root')).render(<PersonalHub />);
+  </script>
+</body>
+</html>
